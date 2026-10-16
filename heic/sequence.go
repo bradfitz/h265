@@ -392,22 +392,29 @@ func (m *movie) alphaTrack(id uint32) *track {
 	return nil
 }
 
-// decodeSequence decodes an image sequence track.
-func (f *file) decodeSequence(o Options) (*HEIC, error) {
+// decodeSequence decodes an image sequence track, the first want frames or
+// all of them when want is zero.
+func (f *file) decodeSequence(o Options, want int) (*HEIC, error) {
 	t := f.movie.pictTrack()
 	if t == nil || t.timescale == 0 {
 		return nil, nil
 	}
 
-	colors, err := f.decodeTrack(t)
+	at := f.movie.alphaTrack(t.id)
+
+	if n := f.frames(); want == 0 && n > 0 && (t.count > n || at != nil && at.count > n) {
+		return nil, ErrUnsupported
+	}
+
+	colors, err := f.decodeTrack(t, want)
 	if err != nil {
 		return nil, err
 	}
 
 	var alphas []*hevc.Picture
 
-	if at := f.movie.alphaTrack(t.id); at != nil {
-		if alphas, err = f.decodeTrack(at); err != nil {
+	if at != nil {
+		if alphas, err = f.decodeTrack(at, want); err != nil {
 			return nil, err
 		}
 	}
@@ -428,6 +435,11 @@ func (f *file) decodeSequence(o Options) (*HEIC, error) {
 		img, err := toImage(pic, alpha, out.Color, o.ToYCbCr)
 		if err != nil {
 			return nil, err
+		}
+
+		colors[i] = nil
+		if alpha != nil {
+			alphas[i] = nil
 		}
 
 		if o.AutoRotate && f.meta != nil {
@@ -467,7 +479,9 @@ func (f *file) sequenceColor(pic *hevc.Picture) ColorInfo {
 	return f.colorInfo(it, pic)
 }
 
-func (f *file) decodeTrack(t *track) ([]*hevc.Picture, error) {
+// decodeTrack decodes the samples of a track until want pictures have come
+// out, or all of them when want is zero.
+func (f *file) decodeTrack(t *track, want int) ([]*hevc.Picture, error) {
 	if t.hvcC == nil {
 		return nil, ErrInvalid
 	}
@@ -515,7 +529,23 @@ func (f *file) decodeTrack(t *track) ([]*hevc.Picture, error) {
 
 			out = append(out, pics...)
 		}
+
+		if want > 0 && len(out) >= want {
+			break
+		}
 	}
 
-	return append(out, d.Flush()...), nil
+	if want == 0 || len(out) < want {
+		out = append(out, d.Flush()...)
+	}
+
+	if want > 0 && len(out) > want {
+		for _, p := range out[want:] {
+			p.Release()
+		}
+
+		out = out[:want]
+	}
+
+	return out, nil
 }

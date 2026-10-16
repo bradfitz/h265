@@ -1506,6 +1506,123 @@ func TestSampleTableBounds(t *testing.T) {
 	}
 }
 
+// sequenceFile writes an image sequence of n copies of one coded picture.
+func sequenceFile(t *testing.T, w, h, n int) []byte {
+	t.Helper()
+
+	src := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	for i := range src.Y {
+		src.Y[i] = byte(i * 3)
+	}
+
+	enc, err := hevc.NewEncoder(hevc.EncoderOptions{Width: w, Height: h, QP: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nals, err := enc.Encode(hevc.Frame{Y: src.Y, Cb: src.Cb, Cr: src.Cr,
+		StrideY: src.YStride, StrideC: src.CStride})
+	if err != nil || len(nals) != 4 {
+		t.Fatalf("encode: %v, %d NAL units", err, len(nals))
+	}
+
+	config, err := marshalHvcC(nals[:3])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slice := hevc.MarshalNAL(nals[3])
+	sample := append(u32(uint32(len(slice))), slice...)
+
+	entry := make([]byte, 78)
+	entry[7] = 1
+	copy(entry[24:], append(u16(uint16(w)), u16(uint16(h))...))
+	entry[33] = 1
+	entry[74], entry[75], entry[76], entry[77] = 0, 24, 0xff, 0xff
+	entry = append(entry, box("hvcC", config)...)
+
+	stbl := func(off uint32) []byte {
+		return box("stbl", concat(
+			fullBox("stsd", 0, 0, append(u32(1), box("hvc1", entry)...)),
+			fullBox("stts", 0, 0, concat(u32(1), u32(uint32(n)), u32(1))),
+			fullBox("stsc", 0, 0, concat(u32(1), u32(1), u32(uint32(n)), u32(1))),
+			fullBox("stsz", 0, 0, append(u32(uint32(len(sample))), u32(uint32(n))...)),
+			fullBox("stco", 0, 0, concat(u32(1), u32(off)))))
+	}
+
+	mdat := bytes.Repeat(sample, n)
+
+	file := func(off uint32) []byte {
+		trak := box("trak", concat(
+			fullBox("tkhd", 0, 0, concat(make([]byte, 8), u32(1), u32(0), u32(uint32(n)))),
+			box("mdia", concat(
+				fullBox("mdhd", 0, 0, concat(make([]byte, 8), u32(30), u32(uint32(n)))),
+				fullBox("hdlr", 0, 0, append(u32(0), []byte("pict")...)),
+				box("minf", stbl(off))))))
+
+		return concat(box("ftyp", []byte("msf1\x00\x00\x00\x00msf1hevc")),
+			box("moov", trak), box("mdat", mdat))
+	}
+
+	head := file(0)
+
+	return file(uint32(len(head) - len(mdat)))
+}
+
+func concat(parts ...[]byte) []byte {
+	var out []byte
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+
+	return out
+}
+
+func TestSequenceBounds(t *testing.T) {
+	const w, h, n = 64, 48, 1100
+
+	data := sequenceFile(t, w, h, n)
+
+	cfg, err := DecodeConfig(bytes.NewReader(data))
+	if err != nil || cfg.Width != w || cfg.Height != h {
+		t.Fatalf("config = %v, %v", cfg, err)
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	img, err := Decode(bytes.NewReader(data))
+
+	runtime.ReadMemStats(&after)
+
+	if err != nil || img.Bounds().Dx() != w || img.Bounds().Dy() != h {
+		t.Fatalf("Decode = %v, %v", img, err)
+	}
+
+	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+		t.Fatalf("Decode of the first frame allocated %d bytes", got)
+	}
+
+	if _, err := DecodeAll(bytes.NewReader(data)); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("DecodeAll of %d frames under the default bound: %v", n, err)
+	}
+
+	if _, err := DecodeAll(bytes.NewReader(data), Options{MaxFrames: 100}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("DecodeAll of %d frames under a bound of 100: %v", n, err)
+	}
+
+	out, err := DecodeAll(bytes.NewReader(data), Options{MaxFrames: -1})
+	if err != nil || len(out.Image) != n || len(out.Delay) != n {
+		t.Fatalf("DecodeAll without a bound: %v, %d frames", err, len(out.Image))
+	}
+
+	out, err = DecodeAll(bytes.NewReader(sequenceFile(t, w, h, 7)))
+	if err != nil || len(out.Image) != 7 || out.Delay[0] != 1.0/30 {
+		t.Fatalf("DecodeAll of 7 frames: %v, %d frames, delay %v", err, len(out.Image), out.Delay)
+	}
+}
+
 func TestMetadataWithoutMeta(t *testing.T) {
 	data := append(box("ftyp", []byte("heic\x00\x00\x00\x00mif1heic")), box("moov", nil)...)
 

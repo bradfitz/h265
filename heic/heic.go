@@ -76,6 +76,9 @@ var ErrUnsupported = errors.New("heic: unsupported image")
 // DefaultFrameSizeLimit bounds the pixel area a header may ask to allocate.
 const DefaultFrameSizeLimit = min(16384*16384, math.MaxInt>>6)
 
+// DefaultMaxFrames bounds the frames DecodeAll decodes from a sequence.
+const DefaultMaxFrames = 1024
+
 // ColorInfo describes the color space an image was decoded from.
 type ColorInfo struct {
 	Primaries uint16
@@ -95,6 +98,9 @@ type Options struct {
 	// FrameSizeLimit bounds a frame's coded area in pixels. Zero means
 	// DefaultFrameSizeLimit; a negative value removes the limit.
 	FrameSizeLimit int
+	// MaxFrames bounds the frames DecodeAll decodes from a sequence. Zero
+	// means DefaultMaxFrames; a negative value removes the limit.
+	MaxFrames int
 	// ToYCbCr forces the image's native color space instead of NRGBA:
 	// *image.YCbCr, *image.NYCbCrA when there is alpha, or *image.Gray when
 	// the image is monochrome. Above 8 bits NRGBA64 is returned anyway.
@@ -121,6 +127,7 @@ type file struct {
 	meta           *metaBox
 	movie          *movie
 	frameSizeLimit int
+	maxFrames      int
 	threads        int
 }
 
@@ -349,6 +356,17 @@ func (f *file) limit() int {
 	return f.frameSizeLimit
 }
 
+func (f *file) frames() int {
+	switch {
+	case f.maxFrames < 0:
+		return 0
+	case f.maxFrames == 0:
+		return DefaultMaxFrames
+	}
+
+	return f.maxFrames
+}
+
 // primary is the item a file describes itself with.
 func (f *file) primary() (*item, error) {
 	if f.meta == nil {
@@ -486,7 +504,7 @@ func (f *file) decodeStill(o Options) (image.Image, ColorInfo, error) {
 			return nil, ColorInfo{}, err
 		}
 
-		seq, serr := f.decodeSequence(o)
+		seq, serr := f.decodeSequence(o, 1)
 		if serr != nil {
 			return nil, ColorInfo{}, serr
 		}
@@ -539,7 +557,8 @@ func (f *file) decodeStill(o Options) (image.Image, ColorInfo, error) {
 	return img, ci, nil
 }
 
-// Decode reads a HEIC image as *image.NRGBA, or *image.NRGBA64 above 8 bits.
+// Decode reads a HEIC image as *image.NRGBA, or *image.NRGBA64 above 8 bits,
+// and the first frame of a sequence.
 func Decode(r io.Reader, opts ...Options) (image.Image, error) {
 	img, _, err := decode(r, opts...)
 
@@ -585,10 +604,11 @@ func DecodeAll(r io.Reader, opts ...Options) (*HEIC, error) {
 
 	o := options(opts)
 	f.frameSizeLimit = o.FrameSizeLimit
+	f.maxFrames = o.MaxFrames
 	f.threads = o.Threads
 
 	if f.movie != nil {
-		seq, err := f.decodeSequence(o)
+		seq, err := f.decodeSequence(o, 0)
 		if err != nil {
 			return nil, err
 		}
