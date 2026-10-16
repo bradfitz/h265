@@ -135,19 +135,23 @@ func cropRect(clap *[8]uint32, w, h int) (int, int, int, int, bool) {
 	return int(x), int(y), int(clapW), int(clapH), true
 }
 
-// applyTransforms runs clean aperture, then rotation, then mirroring, per MIAF 7.3.6.7.
-// hasTransform reports whether AutoRotate would have to touch the pixels.
-func (f *file) hasTransform(it *item) bool {
-	return f.meta.prop(it, "clap") != nil || f.meta.prop(it, "irot") != nil ||
-		f.meta.prop(it, "imir") != nil
-}
-
-func (f *file) applyTransforms(img image.Image, it *item) (image.Image, error) {
+// transform applies the clap, irot and imir properties in that order, per
+// MIAF 7.3.6.7, skipping an aperture already applied by clip.
+func (f *file) transform(it *item, img image.Image, clapped bool) (image.Image, error) {
 	clap := f.meta.prop(it, "clap")
+	if clapped {
+		clap = nil
+	}
+
 	irot := f.meta.prop(it, "irot")
 	imir := f.meta.prop(it, "imir")
+
 	if clap == nil && irot == nil && imir == nil {
 		return img, nil
+	}
+
+	if aliasesPicture(img) {
+		return nil, ErrUnsupported
 	}
 
 	r, ok := toRaw(img)
@@ -172,18 +176,4 @@ func (f *file) applyTransforms(img image.Image, it *item) (image.Image, error) {
 	}
 
 	return r.toImage(), nil
-}
-
-// transform applies the clap, irot and imir properties. The planar images the
-// ToYCbCr path returns alias the decoded planes, so they are converted first.
-func (f *file) transform(it *item, img image.Image) (image.Image, error) {
-	if !f.hasTransform(it) {
-		return img, nil
-	}
-
-	if aliasesPicture(img) {
-		return nil, ErrUnsupported
-	}
-
-	return f.applyTransforms(img, it)
 }

@@ -323,10 +323,13 @@ func (f *heicFile) pixiProp(mono bool) byte {
 func (f *heicFile) add(it encItem, params []hevc.NALUnit) {
 	tile := it.typ == "hvc1" && f.grid
 
-	if tile {
+	switch {
+	case tile:
 		it.assoc = []byte{f.sizeProp(&f.ispeTile, f.tile, f.tile), f.pixiProp(it.mono)}
-	} else {
+	case f.grid:
 		it.assoc = []byte{f.sizeProp(&f.ispe, f.size.X, f.size.Y), f.pixiProp(it.mono)}
+	default:
+		it.assoc = []byte{f.sizeProp(&f.ispe, f.stored.X, f.stored.Y), f.pixiProp(it.mono)}
 	}
 
 	if config, err := marshalHvcC(params); err == nil {
@@ -344,7 +347,7 @@ func (f *heicFile) add(it encItem, params []hevc.NALUnit) {
 	// A grid names its own output size, so only a lone picture needs the clean
 	// aperture that takes the repeated edge back off.
 	if !f.grid && f.clap == 0 && f.stored != f.size {
-		f.clap = f.prop(box("clap", clapData(f.size)), false)
+		f.clap = f.prop(box("clap", clapData(f.size, f.stored)), false)
 	}
 
 	if f.clap != 0 && !tile {
@@ -470,13 +473,13 @@ func (f *heicFile) metaBox(offset uint64) ([]byte, error) {
 	return fullBox("meta", 0, 0, meta), nil
 }
 
-// clapData is the CleanApertureBox naming the whole of the image ispe
-// describes. It is what makes a reader take the stored picture down to that
-// size rather than hand back the repeated edge with it.
-func clapData(size image.Point) []byte {
+// clapData is the CleanApertureBox taking the stored picture, which ispe
+// names, down to the size that went in.
+func clapData(size, stored image.Point) []byte {
 	var out []byte
 
-	for _, v := range [8]int32{int32(size.X), 1, int32(size.Y), 1, 0, 1, 0, 1} {
+	for _, v := range [8]int32{int32(size.X), 1, int32(size.Y), 1,
+		-int32(stored.X - size.X), 2, -int32(stored.Y - size.Y), 2} {
 		out = append(out, u32(uint32(v))...)
 	}
 

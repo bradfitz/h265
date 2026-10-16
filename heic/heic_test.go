@@ -102,7 +102,7 @@ func TestEncode(t *testing.T) {
 
 	// A picture the coding tree cannot fill is padded and cropped back by the
 	// conformance window, so what comes out is the size that went in.
-	for _, size := range [][2]int{{18, 18}, {50, 34}, {130, 98}} {
+	for _, size := range [][2]int{{18, 18}, {50, 34}, {130, 98}, {51, 35}, {33, 16}} {
 		odd := image.NewYCbCr(image.Rect(0, 0, size[0], size[1]), image.YCbCrSubsampleRatio420)
 		for i := range odd.Y {
 			odd.Y[i] = byte(i * 7)
@@ -135,8 +135,44 @@ func TestEncode(t *testing.T) {
 		if !samePlanes(got, odd) {
 			t.Fatalf("%v: planes differ", size)
 		}
-	}
 
+		rotated, err := Decode(bytes.NewReader(b), Options{AutoRotate: true})
+		if err != nil {
+			t.Fatalf("%v: AutoRotate: %v", size, err)
+		}
+
+		if rotated.Bounds() != odd.Rect {
+			t.Fatalf("%v: AutoRotate bounds = %v", size, rotated.Bounds())
+		}
+
+		f, err := parse(memSource(b))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		it, err := f.primary()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		stored := [2]int{roundUp(size[0], 2), roundUp(size[1], 2)}
+
+		if p := f.meta.prop(it, "ispe"); int(p.w) != stored[0] || int(p.h) != stored[1] {
+			t.Fatalf("%v: ispe = %dx%d, want %v", size, p.w, p.h, stored)
+		}
+
+		clap := f.meta.prop(it, "clap")
+		if (clap != nil) != (stored != size) {
+			t.Fatalf("%v: clap present = %v", size, clap != nil)
+		}
+
+		if clap != nil {
+			x, y, w, h, ok := cropRect(&clap.clap, stored[0], stored[1])
+			if !ok || x != 0 || y != 0 || w != size[0] || h != size[1] {
+				t.Fatalf("%v: clap = %d,%d %dx%d ok=%v", size, x, y, w, h, ok)
+			}
+		}
+	}
 }
 
 // TestEncodeConverts codes images the encoder does not take natively. An odd
@@ -1064,13 +1100,6 @@ func TestEncodeExternal(t *testing.T) {
 
 		if gotW != width || gotH != height {
 			t.Fatalf("%dx%d: libheif decoded %dx%d", width, height, gotW, gotH)
-		}
-
-		// A picture stored with a repeated edge comes back through libheif's
-		// transform path, which converts to RGB and loses the samples. The
-		// size is what this case is checking.
-		if width&1 != 0 || height&1 != 0 {
-			continue
 		}
 
 		// libheif hands back the picture the clean aperture leaves, which is

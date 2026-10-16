@@ -432,7 +432,7 @@ func (f *file) decodeSequence(o Options) (*HEIC, error) {
 
 		if o.AutoRotate && f.meta != nil {
 			if it, err := f.primary(); err == nil {
-				if img, err = f.transform(it, img); err != nil {
+				if img, err = f.transform(it, img, false); err != nil {
 					return nil, err
 				}
 			}

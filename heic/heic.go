@@ -503,8 +503,7 @@ func (f *file) decodeStill(o Options) (image.Image, ColorInfo, error) {
 		return nil, ColorInfo{}, err
 	}
 
-	// ISO/IEC 23008-12 7.2.1: ispe is the displayed size.
-	f.clampToISPE(it, pic)
+	clapped := f.clip(it, pic)
 
 	var alpha *hevc.Picture
 
@@ -520,7 +519,7 @@ func (f *file) decodeStill(o Options) (image.Image, ColorInfo, error) {
 	}
 
 	if alpha != nil {
-		f.clampToISPE(it, alpha)
+		f.clip(it, alpha)
 	}
 
 	ci := f.colorInfo(it, pic)
@@ -531,7 +530,7 @@ func (f *file) decodeStill(o Options) (image.Image, ColorInfo, error) {
 	}
 
 	if o.AutoRotate {
-		img, err = f.transform(it, img)
+		img, err = f.transform(it, img, clapped)
 		if err != nil {
 			return nil, ci, err
 		}
@@ -634,15 +633,34 @@ func (f *file) sequenceConfig() (image.Config, error) {
 	return image.Config{Width: t.width, Height: t.height, ColorModel: model}, nil
 }
 
-// clampToISPE trims a decoded picture to the size the item declares.
-func (f *file) clampToISPE(it *item, pic *hevc.Picture) {
-	p := f.meta.prop(it, "ispe")
-	if p == nil {
-		return
+// clip trims a decoded picture to the size the item declares and applies a
+// clean aperture that falls on the chroma grid, reporting whether it did.
+func (f *file) clip(it *item, pic *hevc.Picture) bool {
+	if p := f.meta.prop(it, "ispe"); p != nil {
+		pic.CropW = min(pic.CropW, int(p.w))
+		pic.CropH = min(pic.CropH, int(p.h))
 	}
 
-	pic.CropW = min(pic.CropW, int(p.w))
-	pic.CropH = min(pic.CropH, int(p.h))
+	clap := f.meta.prop(it, "clap")
+	if clap == nil {
+		return false
+	}
+
+	x, y, w, h, ok := cropRect(&clap.clap, pic.CropW, pic.CropH)
+	if !ok {
+		return false
+	}
+
+	sw, sh := subsampling(pic.ChromaFormat)
+	if x%sw != 0 || y%sh != 0 {
+		return false
+	}
+
+	pic.CropX += x
+	pic.CropY += y
+	pic.CropW, pic.CropH = w, h
+
+	return true
 }
 
 // size is the stored size of an item, which is what Decode returns unless
