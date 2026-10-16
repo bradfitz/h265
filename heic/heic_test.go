@@ -1623,6 +1623,60 @@ func TestSequenceBounds(t *testing.T) {
 	}
 }
 
+func TestGenericBrandForward(t *testing.T) {
+	called := 0
+
+	image.RegisterFormat("avif-test", "????ftypavif",
+		func(r io.Reader) (image.Image, error) {
+			called++
+
+			return image.NewNRGBA(image.Rect(0, 0, 2, 2)), nil
+		},
+		func(r io.Reader) (image.Config, error) {
+			called++
+
+			return image.Config{Width: 2, Height: 2}, nil
+		})
+
+	avif := append(box("ftyp", []byte("mif1\x00\x00\x00\x00mif1avifmiaf")), box("meta", nil)...)
+
+	img, name, err := image.Decode(bytes.NewReader(avif))
+	if err != nil || name != "heic" || img.Bounds().Dx() != 2 || called != 1 {
+		t.Fatalf("image.Decode = %v, %q, %v, called %d", img, name, err, called)
+	}
+
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(avif))
+	if err != nil || cfg.Width != 2 || called != 2 {
+		t.Fatalf("image.DecodeConfig = %v, %v, called %d", cfg, err, called)
+	}
+
+	if _, err := Decode(bytes.NewReader(avif)); err == nil || called != 2 {
+		t.Fatalf("Decode forwarded: %v, called %d", err, called)
+	}
+
+	heic := append(box("ftyp", []byte("mif1\x00\x00\x00\x00avifheic")), box("meta", nil)...)
+
+	if _, _, err := image.Decode(bytes.NewReader(heic)); !errors.Is(err, ErrInvalid) || called != 2 {
+		t.Fatalf("image.Decode of a HEVC brand = %v, called %d", err, called)
+	}
+
+	avis := append(box("ftyp", []byte("msf1\x00\x00\x00\x00avis")), box("moov", nil)...)
+
+	if _, _, err := image.Decode(bytes.NewReader(avis)); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("image.Decode with no decoder for the brand = %v", err)
+	}
+
+	if _, _, err := image.DecodeConfig(bytes.NewReader(avis)); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("image.DecodeConfig with no decoder for the brand = %v", err)
+	}
+
+	for _, f := range testdataFiles(t) {
+		if _, name, err := image.Decode(bytes.NewReader(mustRead(t, f))); err != nil || name != "heic" {
+			t.Fatalf("%s: %q, %v", f, name, err)
+		}
+	}
+}
+
 func TestMetadataWithoutMeta(t *testing.T) {
 	data := append(box("ftyp", []byte("heic\x00\x00\x00\x00mif1heic")), box("moov", nil)...)
 

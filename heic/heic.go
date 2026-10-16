@@ -53,10 +53,19 @@ is written as a grid of items instead and reassembled on the way out.
 
 [DecodeExif] reads the Exif item a file describes its image with, and
 [RawExif] and [RawXMP] return the payloads unparsed.
+
+# Registration
+
+The package registers the HEIC brands and the generic mif1 and msf1 with
+[image.RegisterFormat]. A generic brand whose compatible brands name avif or
+avis and no HEVC brand is handed back to [image.Decode] under that brand, so an
+AVIF decoder registered beside this package receives it.
 */
 package heic
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"image"
 	"image/color"
@@ -699,7 +708,90 @@ func (f *file) size(it *item) (int, int, error) {
 }
 
 func decodeWrapper(r io.Reader) (image.Image, error) {
-	return Decode(r)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if forward(data) {
+		img, _, err := image.Decode(bytes.NewReader(data))
+
+		return img, forwarded(err)
+	}
+
+	return Decode(bytes.NewReader(data))
+}
+
+func configWrapper(r io.Reader) (image.Config, error) {
+	head := make([]byte, 8)
+	if _, err := io.ReadFull(r, head); err != nil {
+		return image.Config{}, ErrInvalid
+	}
+
+	ftyp := head
+
+	if n := binary.BigEndian.Uint32(head); string(head[4:8]) == "ftyp" && n >= 16 && n <= 1<<12 {
+		ftyp = make([]byte, n)
+		copy(ftyp, head)
+
+		if _, err := io.ReadFull(r, ftyp[8:]); err != nil {
+			return image.Config{}, ErrInvalid
+		}
+	}
+
+	if forward(ftyp) {
+		cfg, _, err := image.DecodeConfig(io.MultiReader(bytes.NewReader(ftyp), r))
+
+		return cfg, forwarded(err)
+	}
+
+	return DecodeConfig(io.MultiReader(bytes.NewReader(ftyp), r))
+}
+
+// forward rewrites the major brand of a generic file to the codec brand its
+// compatible brands name, when that codec is not HEVC.
+func forward(b []byte) bool {
+	if len(b) < 16 || string(b[4:8]) != "ftyp" {
+		return false
+	}
+
+	n := int(binary.BigEndian.Uint32(b))
+	if n < 16 || n > len(b) {
+		return false
+	}
+
+	if major := string(b[8:12]); major != "mif1" && major != "msf1" {
+		return false
+	}
+
+	other := ""
+
+	for i := 16; i+4 <= n; i += 4 {
+		switch brand := string(b[i : i+4]); brand {
+		case "heic", "heix", "heim", "heis", "hevc", "hevx", "hevm", "hevs":
+			return false
+		case "avif", "avis":
+			if other == "" {
+				other = brand
+			}
+		}
+	}
+
+	if other == "" {
+		return false
+	}
+
+	copy(b[8:12], other)
+
+	return true
+}
+
+func forwarded(err error) error {
+	if errors.Is(err, image.ErrFormat) {
+		return ErrUnsupported
+	}
+
+	return err
 }
 
 func init() {
@@ -707,6 +799,6 @@ func init() {
 		"heic", "heix", "heim", "heis", "hevc", "hevx", "hevm", "hevs",
 		"mif1", "msf1",
 	} {
-		image.RegisterFormat("heic", "????ftyp"+brand, decodeWrapper, DecodeConfig)
+		image.RegisterFormat("heic", "????ftyp"+brand, decodeWrapper, configWrapper)
 	}
 }
