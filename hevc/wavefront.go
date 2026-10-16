@@ -59,6 +59,7 @@ type wave struct {
 	ctx  [][nContexts]uint8
 	err  error
 	bad  bool
+	end  int
 }
 
 func newWave(rows, first int) *wave {
@@ -168,6 +169,8 @@ func (d *ctuDecoder) decodeWavefront(nal NALUnit, sh *sliceHeader, starts []int,
 		return v.err
 	}
 
+	d.nextCTU = v.end
+
 	if rows > 1 {
 		d.saved = v.ctx[rows-1]
 		d.hasSaved = true
@@ -231,6 +234,7 @@ func (d *ctuDecoder) decodeWaveRow(nal NALUnit, sh *sliceHeader, starts []int, v
 				return ErrInvalid
 			}
 
+			v.end = rs + 1
 			v.advance(k, w)
 
 			return nil
@@ -243,6 +247,10 @@ func (d *ctuDecoder) decodeWaveRow(nal NALUnit, sh *sliceHeader, starts []int, v
 
 			v.advance(k, w)
 		}
+	}
+
+	if k == len(starts)-1 {
+		return ErrInvalid
 	}
 
 	return nil

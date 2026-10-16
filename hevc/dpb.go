@@ -238,6 +238,17 @@ func (d *Decoder) dpbLongTerm(poc int32) bool {
 	return false
 }
 
+// clearDPB drops the decoder's hold on every entry; pictures the caller still
+// has stay alive under its own.
+func (d *Decoder) clearDPB() {
+	for i := range d.dpb {
+		d.dpb[i].pic.release()
+	}
+
+	clear(d.dpb)
+	d.dpb = d.dpb[:0]
+}
+
 // dpbRemoveUnused drops the entries C.5.2.2 empties, those neither held for
 // reference nor waiting to be output.
 func (d *Decoder) dpbRemoveUnused() {
@@ -385,6 +396,7 @@ func (d *Decoder) generateUnavailable(rps *refPicSet, s *sps) {
 
 		p := newPicture(&d.pool, s)
 		p.POC = int(poc)
+		p.Corrupt = true
 
 		for cIdx, plane := range [][]uint8{p.Y, p.Cb, p.Cr} {
 			mid := uint8(1) << (p.depth(cIdx) - 1)

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -281,12 +282,15 @@ func TestEncodeLossyIntraTransformChoice(t *testing.T) {
 	}
 
 	var d Decoder
+	var pics []*Picture
 	for _, nal := range nals {
-		if _, err := d.DecodeNAL(nal); err != nil {
+		out, err := d.DecodeNAL(nal)
+		if err != nil {
 			t.Fatalf("DecodeNAL %d: %v", nal.Type, err)
 		}
+		pics = append(pics, out...)
 	}
-	if pics := d.Flush(); len(pics) != 1 {
+	if pics = append(pics, d.Flush()...); len(pics) != 1 {
 		t.Fatalf("pictures = %d", len(pics))
 	}
 	if d.ctuPrev.blk[d.ctuPrev.blkIndex(4, 0)].tuV {
@@ -370,13 +374,16 @@ func TestEncodeTransformEdges(t *testing.T) {
 				}
 
 				var d Decoder
+				var pics []*Picture
 				for _, nal := range e.nals(width, height, rbsp) {
-					if _, err := d.DecodeNAL(nal); err != nil {
+					out, err := d.DecodeNAL(nal)
+					if err != nil {
 						t.Fatalf("DecodeNAL %d: %v", nal.Type, err)
 					}
+					pics = append(pics, out...)
 				}
 
-				if pics := d.Flush(); len(pics) != 1 {
+				if pics = append(pics, d.Flush()...); len(pics) != 1 {
 					t.Fatalf("pictures = %d", len(pics))
 				}
 
@@ -994,14 +1001,17 @@ func TestEncodeCUSize(t *testing.T) {
 			}
 
 			var d Decoder
+			var pics []*Picture
 
 			for _, nal := range nals {
-				if _, err := d.DecodeNAL(nal); err != nil {
+				out, err := d.DecodeNAL(nal)
+				if err != nil {
 					t.Fatalf("DecodeNAL %d: %v", nal.Type, err)
 				}
+				pics = append(pics, out...)
 			}
 
-			if pics := d.Flush(); len(pics) != 1 {
+			if pics = append(pics, d.Flush()...); len(pics) != 1 {
 				t.Fatalf("pictures = %d", len(pics))
 			}
 
@@ -1613,12 +1623,15 @@ func TestEncodeLossyIntraQP(t *testing.T) {
 			_, _, recon := encodeRecon(t, y, cb, cr, width, height, qp)
 
 			var d Decoder
+			var pics []*Picture
 			for _, nal := range nals {
-				if _, err := d.DecodeNAL(nal); err != nil {
+				out, err := d.DecodeNAL(nal)
+				if err != nil {
 					t.Fatalf("DecodeNAL %d: %v", nal.Type, err)
 				}
+				pics = append(pics, out...)
 			}
-			pics := d.Flush()
+			pics = append(pics, d.Flush()...)
 			if len(pics) != 1 {
 				t.Fatalf("pictures = %d", len(pics))
 			}
@@ -1952,6 +1965,7 @@ func TestEncoder(t *testing.T) {
 }
 
 var cannotDecode = map[string]string{
+	"fuzz_bit_depth_change.h265":    "the last coding tree block carries no end_of_slice_segment_flag",
 	"fuzz_dequant_qp_overflow.h265": "slice QP outside the range of 7.4.7.1",
 	"fuzz_mvd_overflow.h265":        "corrupted motion vector difference desyncs the arithmetic decoder",
 }
@@ -2451,5 +2465,481 @@ func TestMalformedStreams(t *testing.T) {
 				decodeQuietly(t, bad)
 			}
 		})
+	}
+}
+
+// accessUnits splits a stream at every first slice segment.
+func accessUnits(nals []NALUnit) [][]NALUnit {
+	var (
+		out [][]NALUnit
+		cur []NALUnit
+	)
+
+	seen := false
+
+	for _, nal := range nals {
+		if seen && nal.Type.IsVCL() && len(nal.RBSP) > 0 && nal.RBSP[0]&0x80 != 0 {
+			out = append(out, cur)
+			cur, seen = nil, false
+		}
+
+		cur = append(cur, nal)
+		seen = seen || nal.Type.IsVCL()
+	}
+
+	if len(cur) > 0 {
+		out = append(out, cur)
+	}
+
+	return out
+}
+
+func lastVCL(unit []NALUnit) int {
+	last := -1
+
+	for i, nal := range unit {
+		if nal.Type.IsVCL() {
+			last = i
+		}
+	}
+
+	return last
+}
+
+func TestPictureCompletesOnFinalSlice(t *testing.T) {
+	manifest := referenceMD5(t)
+
+	for _, name := range []string{
+		"inter_p.h265", "multi_slice.h265", "dep_slices.h265",
+		"multi_slice_sao_deblock_256x256.h265", "ctu64_wpp.h265", "bframes3_128x128.h265",
+	} {
+		for _, threads := range []int{1, 4} {
+			t.Run(fmt.Sprintf("%s/%d", name, threads), func(t *testing.T) {
+				units := accessUnits(SplitAnnexB(mustRead(t, filepath.Join("testdata", name))))
+
+				var d Decoder
+
+				d.Threads(threads)
+
+				h := md5.New()
+				tags := map[uint64]bool{}
+				flushed := 0
+
+				consume := func(out []*Picture) {
+					for _, p := range out {
+						if tags[p.Tag] || p.Tag == 0 || p.Corrupt {
+							t.Fatalf("tag %d seen %v corrupt %v", p.Tag, tags[p.Tag], p.Corrupt)
+						}
+
+						tags[p.Tag] = true
+						h.Write(planarYUV(p))
+						p.Release()
+					}
+				}
+
+				for i, unit := range units {
+					last := lastVCL(unit)
+
+					for j, nal := range unit {
+						nal.Tag = uint64(i + 1)
+
+						out, err := d.DecodeNAL(nal)
+						if err != nil {
+							t.Fatalf("unit %d NAL %d: %v", i, j, err)
+						}
+
+						if d.maxReorder == 0 && nal.Type.IsVCL() && int64(len(out)) != b2i(j == last) {
+							t.Fatalf("unit %d NAL %d: %d pictures", i, j, len(out))
+						}
+
+						consume(out)
+					}
+				}
+
+				out := d.Flush()
+				flushed = len(out)
+				consume(out)
+
+				if d.maxReorder == 0 && flushed != 0 {
+					t.Fatalf("Flush returned %d pictures of a stream without reordering", flushed)
+				}
+
+				if d.maxReorder > 0 && flushed == 0 {
+					t.Fatal("Flush returned nothing of a reordered stream")
+				}
+
+				if len(tags) != len(units) {
+					t.Fatalf("%d pictures of %d units", len(tags), len(units))
+				}
+
+				if got := hex.EncodeToString(h.Sum(nil)); got != manifest[name] {
+					t.Fatalf("digest %s, want %s", got, manifest[name])
+				}
+			})
+		}
+	}
+}
+
+func digestNALs(t *testing.T, nals []NALUnit, releases int) string {
+	t.Helper()
+
+	var d Decoder
+
+	h := md5.New()
+
+	consume := func(out []*Picture) {
+		for _, p := range out {
+			h.Write(planarYUV(p))
+
+			for range releases {
+				p.Release()
+			}
+		}
+	}
+
+	for _, nal := range nals {
+		out, err := d.DecodeNAL(nal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		consume(out)
+	}
+
+	consume(d.Flush())
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func TestReleaseTwice(t *testing.T) {
+	manifest := referenceMD5(t)
+
+	for _, name := range []string{"bframes3_128x128.h265", "motion_320x240.h265"} {
+		nals := SplitAnnexB(mustRead(t, filepath.Join("testdata", name)))
+
+		if got := digestNALs(t, nals, 2); got != manifest[name] {
+			t.Fatalf("%s: digest %s after releasing twice, want %s", name, got, manifest[name])
+		}
+	}
+}
+
+func TestLayerDiscarded(t *testing.T) {
+	const name = "inter_p.h265"
+
+	var nals []NALUnit
+
+	for _, nal := range SplitAnnexB(mustRead(t, filepath.Join("testdata", name))) {
+		nals = append(nals, nal)
+
+		other := nal
+		other.LayerID = 1
+		nals = append(nals, other)
+	}
+
+	if got, want := digestNALs(t, nals, 1), referenceMD5(t)[name]; got != want {
+		t.Fatalf("digest %s with a second layer interleaved, want %s", got, want)
+	}
+}
+
+func TestCorruptReference(t *testing.T) {
+	units := accessUnits(SplitAnnexB(mustRead(t, "testdata/motion_320x240.h265")))
+
+	var d Decoder
+
+	for _, nal := range units[0] {
+		if !nal.Type.IsVCL() {
+			if _, err := d.DecodeNAL(nal); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	corrupt := 0
+
+	for i, unit := range units[1:] {
+		for _, nal := range unit {
+			nal.Tag = uint64(i + 1)
+
+			out, err := d.DecodeNAL(nal)
+			if err != nil {
+				t.Fatalf("unit %d without the IDR: %v", i+1, err)
+			}
+
+			for _, p := range out {
+				if !p.Corrupt {
+					t.Fatalf("picture %d predicted from a missing IDR is not corrupt", p.Tag)
+				}
+
+				corrupt++
+				p.Release()
+			}
+		}
+	}
+
+	if corrupt == 0 {
+		t.Fatal("nothing came out")
+	}
+
+	clean := 0
+
+	for i, unit := range units[:2] {
+		for _, nal := range unit {
+			nal.Tag = uint64(100 + i)
+
+			out, err := d.DecodeNAL(nal)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, p := range out {
+				if p.Tag >= 100 && p.Corrupt {
+					t.Fatalf("picture %d after the IDR is corrupt", p.Tag)
+				}
+
+				if p.Tag >= 100 {
+					clean++
+				}
+			}
+		}
+	}
+
+	for _, p := range d.Flush() {
+		if p.Tag >= 100 && p.Corrupt {
+			t.Fatalf("picture %d after the IDR is corrupt", p.Tag)
+		}
+
+		if p.Tag >= 100 {
+			clean++
+		}
+	}
+
+	if clean != 2 {
+		t.Fatalf("%d clean pictures after the IDR, want 2", clean)
+	}
+}
+
+func TestLostSlice(t *testing.T) {
+	feed := func(d *Decoder, unit []NALUnit, tag uint64, skip ...int) ([]*Picture, error) {
+		var out []*Picture
+
+		for i, nal := range unit {
+			if slices.Contains(skip, i) {
+				continue
+			}
+
+			nal.Tag = tag
+
+			pics, err := d.DecodeNAL(nal)
+			out = append(out, pics...)
+
+			if err != nil {
+				return out, err
+			}
+		}
+
+		return out, nil
+	}
+
+	t.Run("last", func(t *testing.T) {
+		unit := accessUnits(SplitAnnexB(mustRead(t, "testdata/multi_slice.h265")))[0]
+
+		var d Decoder
+
+		out, err := feed(&d, unit, 1, lastVCL(unit))
+		if err != nil || len(out) != 0 {
+			t.Fatalf("%d pictures, %v", len(out), err)
+		}
+
+		out = d.Flush()
+		if len(out) != 1 || !out[0].Corrupt {
+			t.Fatalf("Flush: %d pictures", len(out))
+		}
+	})
+
+	t.Run("next", func(t *testing.T) {
+		units := accessUnits(SplitAnnexB(mustRead(t, "testdata/multi_slice_sao_deblock_256x256.h265")))
+
+		var d Decoder
+
+		out, err := feed(&d, units[0], 1, lastVCL(units[0]))
+		if err != nil || len(out) != 0 {
+			t.Fatalf("%d pictures, %v", len(out), err)
+		}
+
+		more, err := feed(&d, units[1], 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		out = append(append(out, more...), d.Flush()...)
+		if len(out) != 2 {
+			t.Fatalf("%d pictures of 2", len(out))
+		}
+
+		for _, p := range out {
+			if p.Tag == 1 && !p.Corrupt {
+				t.Fatal("the picture missing its last slice is not corrupt")
+			}
+		}
+	})
+
+	t.Run("after", func(t *testing.T) {
+		unit := accessUnits(SplitAnnexB(mustRead(t, "testdata/multi_slice.h265")))[0]
+
+		var d Decoder
+
+		if _, err := feed(&d, unit, 1); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := d.DecodeNAL(unit[lastVCL(unit)]); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("a slice after the picture completed: %v", err)
+		}
+	})
+
+	root := conformanceRoot(t)
+	unit := accessUnits(SplitAnnexB(mustRead(t,
+		filepath.Join(root, "conformance/JCT-VC-HEVC_V1/SLICES_A_Rovi_3/SLICES_A_Rovi_3.bin"))))[0]
+
+	var vcl []int
+
+	for i, nal := range unit {
+		if nal.Type.IsVCL() {
+			vcl = append(vcl, i)
+		}
+	}
+
+	if len(vcl) < 3 {
+		t.Fatalf("%d slices", len(vcl))
+	}
+
+	t.Run("gap", func(t *testing.T) {
+		var d Decoder
+
+		out, err := feed(&d, unit, 1, vcl[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if out = append(out, d.Flush()...); len(out) != 1 || !out[0].Corrupt {
+			t.Fatalf("%d pictures", len(out))
+		}
+	})
+
+	t.Run("overlap", func(t *testing.T) {
+		var d Decoder
+
+		if _, err := feed(&d, unit[:vcl[2]], 1); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := d.DecodeNAL(unit[vcl[1]]); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("a slice repeated: %v", err)
+		}
+
+		out, err := feed(&d, unit[vcl[2]:], 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if out = append(out, d.Flush()...); len(out) != 1 || !out[0].Corrupt {
+			t.Fatalf("after the repeat: %d pictures", len(out))
+		}
+	})
+}
+
+func TestReset(t *testing.T) {
+	const name = "inter_p.h265"
+
+	nals := SplitAnnexB(mustRead(t, filepath.Join("testdata", name)))
+	units := accessUnits(nals)
+
+	var d Decoder
+
+	d.FrameSizeLimit(1 << 24)
+
+	var held []*Picture
+
+	for _, nal := range units[0] {
+		out, err := d.DecodeNAL(nal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		held = append(held, out...)
+	}
+
+	held = append(held, d.Flush()...)
+	if len(held) != 1 {
+		t.Fatalf("%d pictures from the first unit", len(held))
+	}
+
+	before := planarYUV(held[0])
+
+	d.Reset()
+
+	if d.sps != nil || d.frameSizeLimit != 1<<24 {
+		t.Fatal("Reset kept the parameter sets or dropped the limit")
+	}
+
+	h := md5.New()
+
+	for _, nal := range nals {
+		out, err := d.DecodeNAL(nal)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, p := range out {
+			h.Write(planarYUV(p))
+			p.Release()
+		}
+	}
+
+	for _, p := range d.Flush() {
+		h.Write(planarYUV(p))
+		p.Release()
+	}
+
+	if got, want := hex.EncodeToString(h.Sum(nil)), referenceMD5(t)[name]; got != want {
+		t.Fatalf("digest %s after Reset, want %s", got, want)
+	}
+
+	if !bytes.Equal(planarYUV(held[0]), before) {
+		t.Fatal("a picture held across Reset changed")
+	}
+
+	held[0].Release()
+}
+
+func TestPicturePoolBounded(t *testing.T) {
+	var pool picPool
+
+	for i := range 4 * picPoolDepth {
+		s := &sps{
+			picWidthInLumaSamples: uint32(64 + 16*i), picHeightInLumaSamples: 64,
+			chromaFormatIDC: 1, subWidthC: 2, subHeightC: 2,
+			bitDepthLuma: 8, bitDepthChroma: 8,
+		}
+
+		newPicture(&pool, s).Release()
+	}
+
+	if len(pool.free) > picPoolDepth {
+		t.Fatalf("%d pictures cached, limit %d", len(pool.free), picPoolDepth)
+	}
+
+	s := &sps{
+		picWidthInLumaSamples: 64, picHeightInLumaSamples: 64,
+		chromaFormatIDC: 1, subWidthC: 2, subHeightC: 2,
+		bitDepthLuma: 8, bitDepthChroma: 8,
+	}
+
+	p := newPicture(&pool, s)
+	y := &p.Y[0]
+	p.Release()
+
+	if q := newPicture(&pool, s); &q.Y[0] != y {
+		t.Fatal("the newest shape was not recycled")
 	}
 }

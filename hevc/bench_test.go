@@ -133,8 +133,13 @@ func BenchmarkDecodeStill(b *testing.B) {
 		var d Decoder
 
 		for _, nal := range nals {
-			if _, err := d.DecodeNAL(nal); err != nil {
+			out, err := d.DecodeNAL(nal)
+			if err != nil {
 				b.Fatal(err)
+			}
+
+			for _, p := range out {
+				p.Release()
 			}
 		}
 

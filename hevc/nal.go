@@ -62,6 +62,10 @@ type NALUnit struct {
 	RBSP       []byte
 
 	EPB []uint32
+
+	// Tag is the caller's own label, carried from the first slice of a
+	// picture to Picture.Tag through any reordering.
+	Tag uint64
 }
 
 // ParseNAL parses a single NAL unit with a two-byte header and no framing.

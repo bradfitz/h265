@@ -2,9 +2,12 @@
 Package hevc decodes an HEVC (H.265) bitstream, and encodes an intra-only one.
 
 [Decoder.DecodeNAL] takes one NAL unit at a time and returns the pictures that
-are ready, which is not the same as the pictures it just decoded: a stream that
-codes out of display order is held back by sps_max_num_reorder_pics and released
-by picture order count. [Decoder.Flush] drains what is left at the end.
+are ready. A picture is finished by the slice that completes it, but a stream
+that codes out of display order is held back by sps_max_num_reorder_pics and
+released by picture order count, so what comes out of a call is not always what
+it decoded. [Decoder.Flush] drains what is left at the end of a sequence and
+[Decoder.Reset] discards it. A [NALUnit.Tag] on the first slice of a picture
+comes back as [Picture.Tag], whatever the reordering.
 
 	var d hevc.Decoder
 
@@ -73,6 +76,11 @@ valid and declares a coding tool this decoder does not implement, which is
 refused rather than decoded into a picture that merely looks plausible. Those
 tools are cross-component prediction, implicit and explicit RDPCM, and CABAC
 bypass alignment; everything else in the range extensions is applied.
+
+A picture that lost a slice, failed partway, or was predicted from a reference
+the stream never delivered still comes out, with [Picture.Corrupt] set. NAL
+units of a layer other than the base are discarded, as 7.4.2.2 asks of a
+single-layer decoder.
 */
 package hevc
 
@@ -84,6 +92,7 @@ type Decoder struct {
 
 	cur      *Picture
 	curOut   bool
+	curLsb   uint32
 	ctu      *ctuDecoder
 	ctuPrev  *ctuDecoder
 	prevSlic *sliceHeader
@@ -106,18 +115,21 @@ type Decoder struct {
 	maxDecPicBuf int
 }
 
-// DecodeNAL consumes one NAL unit and returns whatever pictures that completes,
-// in output order. Reordering means a picture may surface several NAL units
-// after the one that finished it.
 // FrameSizeLimit refuses a sequence whose pictures are larger than n samples,
 // with ErrUnsupported. Zero, the default, accepts anything the level allows.
 func (d *Decoder) FrameSizeLimit(n int) { d.frameSizeLimit = n }
 
+// DecodeNAL consumes one NAL unit and returns the pictures ready for output,
+// in output order. Pictures returned beside an error are good.
 func (d *Decoder) DecodeNAL(nal NALUnit) ([]*Picture, error) {
 	if d.sps == nil {
 		d.vps = make(map[uint8]*vps)
 		d.sps = make(map[uint32]*sps)
 		d.pps = make(map[uint32]*pps)
+	}
+
+	if nal.LayerID != 0 {
+		return nil, nil
 	}
 
 	switch nal.Type {
@@ -162,7 +174,8 @@ func (d *Decoder) DecodeNAL(nal NALUnit) ([]*Picture, error) {
 		return nil, nil
 	}
 
-	if nal.Type.IsIRAP() {
+	// 8.1.3 decides NoRaslOutputFlag once per picture, on its first slice.
+	if nal.Type.IsIRAP() && len(nal.RBSP) > 0 && nal.RBSP[0]&0x80 != 0 {
 		d.skipRASL = !d.seenPicture || nal.Type.IsIDR() ||
 			(nal.Type >= NALBlaWLP && nal.Type <= NALBlaNLP)
 		d.seenPicture = true
@@ -178,7 +191,8 @@ func (d *Decoder) DecodeNAL(nal NALUnit) ([]*Picture, error) {
 }
 
 // Flush ends the sequence and returns every picture still held back for
-// reordering, in output order.
+// reordering, in output order. The parameter sets stay; the next picture
+// starts a new sequence, as after an end of sequence NAL unit.
 func (d *Decoder) Flush() []*Picture {
 	out := d.finishPicture()
 
@@ -191,16 +205,29 @@ func (d *Decoder) Flush() []*Picture {
 		out = append(out, p)
 	}
 
-	d.cur, d.ctu, d.prevSlic = nil, nil, nil
-
-	for i := range d.dpb {
-		d.dpb[i].pic.release()
-	}
-
-	clear(d.dpb)
-	d.dpb = d.dpb[:0]
+	d.endSequence()
 
 	return out
+}
+
+// Reset discards everything but the thread and size limits: the picture in
+// progress, the pictures held back for output, the references and the
+// parameter sets. Pictures already returned stay valid until released.
+func (d *Decoder) Reset() {
+	if d.cur != nil {
+		d.cur.release()
+	}
+
+	d.clearDPB()
+
+	*d = Decoder{threads: d.threads, frameSizeLimit: d.frameSizeLimit}
+}
+
+func (d *Decoder) endSequence() {
+	d.cur, d.ctu, d.prevSlic = nil, nil, nil
+	d.curRPS, d.poc = refPicSet{}, pocState{}
+	d.seenPicture, d.skipRASL = false, false
+	d.clearDPB()
 }
 
 // finishPicture runs the loop filters over the picture the decoder has been
@@ -212,6 +239,10 @@ func (d *Decoder) finishPicture() []*Picture {
 	}
 
 	if d.ctu != nil {
+		if !d.ctu.complete() {
+			d.cur.Corrupt = true
+		}
+
 		d.ctu.storeColMotion()
 		d.ctu.deblock()
 		d.ctu.applySAO()
@@ -274,7 +305,7 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 	var done []*Picture
 
 	if sh.firstSliceSegmentInPic {
-		prior := d.cur != nil
+		prior := d.cur != nil || len(d.dpb) != 0
 
 		done = append(done, d.finishPicture()...)
 
@@ -313,7 +344,7 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 				}
 			}
 
-			d.dpb = nil
+			d.clearDPB()
 		default:
 			d.dpbMark(&rps)
 			d.dpbRemoveUnused()
@@ -321,6 +352,17 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 		}
 
 		if sh.sliceType != sliceI {
+			// The references 8.3.3 makes up take slots of their own, so
+			// pending output goes out first to leave them room.
+			for missing := d.missingRefs(&rps); len(d.dpb)+missing+1 > d.maxDecPicBuf; {
+				q := d.dpbBump()
+				if q == nil {
+					break
+				}
+
+				done = append(done, q)
+			}
+
 			d.generateUnavailable(&rps, s)
 		}
 
@@ -328,6 +370,8 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 
 		d.cur = newPicture(&d.pool, s)
 		d.cur.POC = int(poc)
+		d.cur.Tag = nal.Tag
+		d.curLsb = sh.picOrderCntLsb
 		d.curOut = sh.picOutputFlag
 		d.ctu = newCTUDecoder(d.ctuPrev, s, p, sh, d.cur)
 		d.ctu.threads = d.waveThreads()
@@ -335,8 +379,8 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 		d.ctu.poc = poc
 	}
 
-	if d.cur == nil || d.ctu == nil {
-		return nil, ErrInvalid
+	if d.cur == nil || d.ctu == nil || sh.picOrderCntLsb != d.curLsb {
+		return done, ErrInvalid
 	}
 
 	d.ctu.sh = sh
@@ -346,10 +390,36 @@ func (d *Decoder) decodeSlice(nal NALUnit) ([]*Picture, error) {
 	d.buildRefLists(sh)
 
 	if err := d.ctu.decodeSliceData(nal, sh); err != nil {
-		return nil, err
+		d.cur.Corrupt = true
+
+		return done, err
+	}
+
+	if d.ctu.complete() {
+		done = append(done, d.finishPicture()...)
 	}
 
 	return done, nil
+}
+
+func (d *Decoder) missingRefs(rps *refPicSet) int {
+	n := 0
+
+	for _, l := range [][]int32{rps.stCurrBefore, rps.stCurrAfter, rps.ltCurr,
+		rps.stFoll, rps.ltFoll} {
+		for _, poc := range l {
+			if d.dpbFind(poc) == nil {
+				n++
+			}
+		}
+	}
+
+	return n
+}
+
+// complete reports that every coding tree block of the picture is reconstructed.
+func (d *ctuDecoder) complete() bool {
+	return d.nextCTU == int(d.s.picWidthInCtbs)*int(d.s.picHeightInCtbs)
 }
 
 func (d *Decoder) ppsForSlice(nal NALUnit) (*pps, bool, error) {
@@ -394,7 +464,16 @@ func (d *ctuDecoder) decodeSliceData(nal NALUnit, sh *sliceHeader) error {
 
 	sub := 0
 
+	// 7.4.7.1 orders the segments of a picture in tile scan.
 	start := int(d.rsToTs[sh.sliceSegmentAddress])
+	if start < d.nextCTU {
+		return ErrInvalid
+	}
+
+	if start > d.nextCTU {
+		d.pic.Corrupt = true
+	}
+
 	tileStart := start == 0 || d.tileID[start] != d.tileID[start-1]
 
 	if err := d.startSubstream(nal, sh, starts, sub, tileStart); err != nil {
@@ -445,6 +524,8 @@ func (d *ctuDecoder) decodeSliceData(nal NALUnit, sh *sliceHeader) error {
 			return err
 		}
 
+		d.nextCTU = ts + 1
+
 		if wpp && rs%w == 1 {
 			d.saved = d.c.state
 			d.hasSaved = true
@@ -482,7 +563,7 @@ func (d *ctuDecoder) decodeSliceData(nal NALUnit, sh *sliceHeader) error {
 		}
 	}
 
-	return nil
+	return ErrInvalid
 }
 
 // substreamStarts converts the entry point offsets, which count bytes of the
@@ -568,8 +649,13 @@ func (d *Decoder) buildRefLists(sh *sliceHeader) {
 		d.ctu.refLong[l] = make([]bool, len(pocs))
 
 		for i, p := range pocs {
-			d.ctu.refPics[l][i] = d.dpbFind(p)
+			ref := d.dpbFind(p)
+			d.ctu.refPics[l][i] = ref
 			d.ctu.refLong[l][i] = d.dpbLongTerm(p)
+
+			if ref == nil || ref.Corrupt {
+				d.cur.Corrupt = true
+			}
 		}
 	}
 

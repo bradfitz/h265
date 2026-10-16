@@ -116,6 +116,7 @@ type ctuDecoder struct {
 	ctbSlice       []int32
 	slices         []*sliceHeader
 	depSliceAddrRs int
+	nextCTU        int
 
 	coef    [32 * 32]int32
 	scratch transformScratch

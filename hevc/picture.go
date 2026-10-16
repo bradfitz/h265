@@ -28,6 +28,13 @@ type Picture struct {
 
 	POC int
 
+	// Tag is the NALUnit.Tag of the picture's first slice.
+	Tag uint64
+
+	// Corrupt reports a lost or failed slice, or prediction from a reference
+	// that was missing or itself corrupt.
+	Corrupt bool
+
 	Y, Cb, Cr       []uint8
 	Y16, Cb16, Cr16 []uint16
 
@@ -37,8 +44,9 @@ type Picture struct {
 	Col  []colMotion
 	ColW int
 
-	pool *picPool
-	refs int32
+	pool     *picPool
+	refs     int32
+	released bool
 }
 
 // Release hands the picture's memory back to the decoder that produced it, to
@@ -46,6 +54,11 @@ type Picture struct {
 // collected as any other value would be. Reading the planes afterwards is a
 // mistake; releasing twice is not, and does nothing.
 func (p *Picture) Release() {
+	if p == nil || p.released {
+		return
+	}
+
+	p.released = true
 	p.release()
 }
 
@@ -110,14 +123,19 @@ func (p *Picture) geom() picGeom {
 	}
 }
 
-// picPoolDepth bounds how many pictures of one shape are kept, so a sequence
-// that changes resolution cannot make the pool grow without end.
+// picPoolDepth bounds how many pictures are kept across every shape, so a
+// sequence that changes resolution cannot make the pool grow without end.
 const picPoolDepth = 8
 
 // picPool holds the pictures nobody references any more. A decoder keeps one,
 // so everything it recycles came from the same sequence.
 type picPool struct {
-	free map[picGeom][]picBufs
+	free []cachedPicture
+}
+
+type cachedPicture struct {
+	geom picGeom
+	bufs picBufs
 }
 
 func (pl *picPool) get(g picGeom) (picBufs, bool) {
@@ -125,16 +143,21 @@ func (pl *picPool) get(g picGeom) (picBufs, bool) {
 		return picBufs{}, false
 	}
 
-	free := pl.free[g]
-	if len(free) == 0 {
-		return picBufs{}, false
+	for i := len(pl.free) - 1; i >= 0; i-- {
+		if pl.free[i].geom != g {
+			continue
+		}
+
+		b := pl.free[i].bufs
+		last := len(pl.free) - 1
+		pl.free[i] = pl.free[last]
+		pl.free[last] = cachedPicture{}
+		pl.free = pl.free[:last]
+
+		return b, true
 	}
 
-	b := free[len(free)-1]
-	free[len(free)-1] = picBufs{}
-	pl.free[g] = free[:len(free)-1]
-
-	return b, true
+	return picBufs{}, false
 }
 
 func (pl *picPool) put(g picGeom, b picBufs) {
@@ -142,12 +165,18 @@ func (pl *picPool) put(g picGeom, b picBufs) {
 		return
 	}
 
-	if pl.free == nil {
-		pl.free = make(map[picGeom][]picBufs)
+	if len(pl.free) < picPoolDepth {
+		pl.free = append(pl.free, cachedPicture{g, b})
+
+		return
 	}
 
-	if len(pl.free[g]) < picPoolDepth {
-		pl.free[g] = append(pl.free[g], b)
+	for i := range pl.free {
+		if pl.free[i].geom != g {
+			pl.free[i] = cachedPicture{g, b}
+
+			return
+		}
 	}
 }
 
