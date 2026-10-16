@@ -49,6 +49,11 @@ A picture larger than [hevc.MaxLumaSamples] has no level to be coded at, so it
 is written as a grid of items instead and reassembled on the way out.
 [EncodeOptions.Tile] asks for one at any size.
 
+# Thumbnails
+
+[DecodeThumbnail] decodes the item a file links to its primary image with a
+thmb reference, and [DecodeThumbnailConfig] reports its size.
+
 # Metadata
 
 [DecodeExif] reads the Exif item a file describes its image with, and
@@ -72,6 +77,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"slices"
 
 	"github.com/gen2brain/h265/hevc"
 )
@@ -81,6 +87,10 @@ import (
 // sample format it has no conversion for. A caller that has another decoder to
 // fall back on should test for this one rather than [ErrInvalid].
 var ErrUnsupported = errors.New("heic: unsupported image")
+
+// ErrNoThumbnail is returned when no item is linked to the primary image as
+// its thumbnail.
+var ErrNoThumbnail = errors.New("heic: no thumbnail")
 
 // DefaultFrameSizeLimit bounds the pixel area a header may ask to allocate.
 const DefaultFrameSizeLimit = min(16384*16384, math.MaxInt>>6)
@@ -394,6 +404,33 @@ func (f *file) primary() (*item, error) {
 	return it, nil
 }
 
+// thumbnail is the item linked to the primary image by a thmb reference.
+func (f *file) thumbnail() (*item, error) {
+	primary, err := f.primary()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range f.meta.refs {
+		if r.typ != "thmb" || !slices.Contains(r.to, primary.id) {
+			continue
+		}
+
+		it := f.meta.items[r.from]
+		if it == nil {
+			continue
+		}
+
+		if it.unsupported {
+			return nil, ErrUnsupported
+		}
+
+		return it, nil
+	}
+
+	return nil, ErrNoThumbnail
+}
+
 // alphaOf finds the auxiliary item that carries this item's alpha channel.
 func (f *file) alphaOf(id uint32) *item {
 	for _, r := range f.meta.refs {
@@ -504,8 +541,8 @@ func wrap(err error) error {
 	return ErrInvalid
 }
 
-// decodeStill decodes the primary item, its alpha, and any grid it derives
-// from, and converts the result.
+// decodeStill decodes the primary item, or the picture track of a file that
+// has no usable one.
 func (f *file) decodeStill(o Options) (image.Image, ColorInfo, error) {
 	it, err := f.primary()
 	if err != nil {
@@ -525,6 +562,12 @@ func (f *file) decodeStill(o Options) (image.Image, ColorInfo, error) {
 		return seq.Image[0], seq.Color, nil
 	}
 
+	return f.decodeItemImage(it, o)
+}
+
+// decodeItemImage decodes one image item, its alpha, and any grid it derives
+// from, and converts the result.
+func (f *file) decodeItemImage(it *item, o Options) (image.Image, ColorInfo, error) {
 	pic, err := f.decodeImage(it)
 	if err != nil {
 		return nil, ColorInfo{}, err
@@ -596,6 +639,55 @@ func decode(r io.Reader, opts ...Options) (image.Image, ColorInfo, error) {
 	f.threads = o.Threads
 
 	return f.decodeStill(o)
+}
+
+// DecodeThumbnail reads the thumbnail of a HEIC image as *image.NRGBA, or
+// *image.NRGBA64 above 8 bits. It returns ErrNoThumbnail when the file
+// carries none.
+func DecodeThumbnail(r io.Reader, opts ...Options) (image.Image, error) {
+	src, err := srcFor(r)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := parse(src)
+	if err != nil {
+		return nil, err
+	}
+
+	it, err := f.thumbnail()
+	if err != nil {
+		return nil, err
+	}
+
+	o := options(opts)
+	f.frameSizeLimit = o.FrameSizeLimit
+	f.threads = o.Threads
+
+	img, _, err := f.decodeItemImage(it, o)
+
+	return img, err
+}
+
+// DecodeThumbnailConfig returns the dimensions and color model of the
+// thumbnail without decoding it.
+func DecodeThumbnailConfig(r io.Reader) (image.Config, error) {
+	f, err := parseHeader(r)
+	if err != nil {
+		return image.Config{}, err
+	}
+
+	it, err := f.thumbnail()
+	if err != nil {
+		return image.Config{}, err
+	}
+
+	w, h, err := f.size(it)
+	if err != nil {
+		return image.Config{}, err
+	}
+
+	return image.Config{Width: w, Height: h, ColorModel: colorModelFor(f, it)}, nil
 }
 
 // DecodeAll returns every frame of an image sequence with its duration, and
@@ -670,18 +762,10 @@ func (f *file) clip(it *item, pic *hevc.Picture) bool {
 		pic.CropH = min(pic.CropH, int(p.h))
 	}
 
-	clap := f.meta.prop(it, "clap")
-	if clap == nil {
-		return false
-	}
-
-	x, y, w, h, ok := cropRect(&clap.clap, pic.CropW, pic.CropH)
-	if !ok {
-		return false
-	}
-
 	sw, sh := subsampling(pic.ChromaFormat)
-	if x%sw != 0 || y%sh != 0 {
+
+	x, y, w, h, ok := f.aperture(it, pic.CropW, pic.CropH, sw, sh)
+	if !ok {
 		return false
 	}
 
@@ -692,8 +776,42 @@ func (f *file) clip(it *item, pic *hevc.Picture) bool {
 	return true
 }
 
-// size is the stored size of an item, which is what Decode returns unless
-// AutoRotate transforms it.
+// aperture is the item's clean aperture within a picture of the given size,
+// when it has one that falls on the chroma grid.
+func (f *file) aperture(it *item, w, h, sw, sh int) (int, int, int, int, bool) {
+	clap := f.meta.prop(it, "clap")
+	if clap == nil {
+		return 0, 0, 0, 0, false
+	}
+
+	x, y, cw, ch, ok := cropRect(&clap.clap, w, h)
+	if !ok || x%sw != 0 || y%sh != 0 {
+		return 0, 0, 0, 0, false
+	}
+
+	return x, y, cw, ch, true
+}
+
+// chromaOf is the chroma subsampling an item's decoder configuration declares,
+// taken from the first tile of a grid.
+func (f *file) chromaOf(it *item) (int, int) {
+	cfg := f.meta.prop(it, "hvcC")
+
+	if cfg == nil && it.typ == "grid" {
+		if tiles := f.meta.refsTo("dimg", it.id); len(tiles) > 0 {
+			cfg = f.meta.prop(f.meta.items[tiles[0]], "hvcC")
+		}
+	}
+
+	if cfg == nil || cfg.hvcC == nil {
+		return 2, 2
+	}
+
+	return subsampling(int(cfg.hvcC.chromaFormat))
+}
+
+// size is the size Decode returns for an item unless AutoRotate transforms
+// it: the stored size, inside any clean aperture clip applies.
 func (f *file) size(it *item) (int, int, error) {
 	p := f.meta.prop(it, "ispe")
 	if p == nil {
@@ -702,6 +820,12 @@ func (f *file) size(it *item) (int, int, error) {
 
 	if p.w == 0 || p.h == 0 || p.w > 1<<20 || p.h > 1<<20 {
 		return 0, 0, ErrInvalid
+	}
+
+	sw, sh := f.chromaOf(it)
+
+	if _, _, w, h, ok := f.aperture(it, int(p.w), int(p.h), sw, sh); ok {
+		return w, h, nil
 	}
 
 	return int(p.w), int(p.h), nil

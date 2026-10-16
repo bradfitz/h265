@@ -55,7 +55,7 @@ stream := hevc.MarshalAnnexB(nals)
 Decoding: 8-16 bit, 4:2:0/4:2:2/4:4:4/monochrome, tiles, wavefronts, dependent slice segments,
 PCM, lossless, scaling lists, and the range extensions other than cross-component prediction,
 RDPCM and CABAC bypass alignment, which are refused rather than decoded wrongly. In the container
-alpha, `grid`, `clap`/`irot`/`imir`, `colr`, image sequences, Exif and XMP.
+alpha, `grid`, `clap`/`irot`/`imir`, `colr`, image sequences, thumbnails, Exif and XMP.
 
 Encoding: 8-12 bit, 4:2:0/4:2:2/4:4:4/monochrome, intra only, deblocking, sample adaptive
 offset, wavefronts, PCM lossless, and alpha, `grid`, `colr`, Exif and XMP in the container. A picture too large for

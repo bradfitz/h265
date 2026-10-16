@@ -1677,6 +1677,137 @@ func TestGenericBrandForward(t *testing.T) {
 	}
 }
 
+func TestDecodeThumbnail(t *testing.T) {
+	data := mustRead(t, "testdata/thumb.heic")
+
+	cfg, err := DecodeThumbnailConfig(bytes.NewReader(data))
+	if err != nil || cfg.Width != 64 || cfg.Height != 48 || cfg.ColorModel != color.NRGBAModel {
+		t.Fatalf("config = %v, %v", cfg, err)
+	}
+
+	img, err := DecodeThumbnail(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	thumb, ok := img.(*image.NRGBA)
+	if !ok || thumb.Rect != image.Rect(0, 0, 64, 48) {
+		t.Fatalf("thumbnail = %T %v", img, img.Bounds())
+	}
+
+	planar, err := DecodeThumbnail(bytes.NewReader(data), Options{ToYCbCr: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ycc, ok := planar.(*image.YCbCr); !ok || ycc.Rect != thumb.Rect {
+		t.Fatalf("planar thumbnail = %T %v", planar, planar.Bounds())
+	}
+
+	full, err := Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mean := func(m *image.NRGBA) [3]float64 {
+		var sum [3]float64
+		for i := 0; i+3 < len(m.Pix); i += 4 {
+			for c := range sum {
+				sum[c] += float64(m.Pix[i+c])
+			}
+		}
+		n := float64(len(m.Pix) / 4)
+
+		return [3]float64{sum[0] / n, sum[1] / n, sum[2] / n}
+	}
+
+	a, b := mean(thumb), mean(full.(*image.NRGBA))
+	for c := range a {
+		if d := a[c] - b[c]; d > 8 || d < -8 {
+			t.Fatalf("thumbnail mean %v, image mean %v", a, b)
+		}
+	}
+
+	for _, name := range []string{"basic.heic", "alpha.heic"} {
+		b := mustRead(t, "testdata/"+name)
+
+		if _, err := DecodeThumbnail(bytes.NewReader(b)); !errors.Is(err, ErrNoThumbnail) {
+			t.Errorf("%s: DecodeThumbnail: %v", name, err)
+		}
+
+		if _, err := DecodeThumbnailConfig(bytes.NewReader(b)); !errors.Is(err, ErrNoThumbnail) {
+			t.Errorf("%s: DecodeThumbnailConfig: %v", name, err)
+		}
+	}
+
+	if _, err := exec.LookPath("dec265"); err != nil {
+		t.Skip("dec265 not installed")
+	}
+
+	f, err := parse(memSource(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := f.thumbnail()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := f.meta.prop(it, "hvcC").hvcC
+
+	var nals []hevc.NALUnit
+	for _, b := range rec.paramSets {
+		u, ok := hevc.ParseNAL(b)
+		if !ok {
+			t.Fatal("bad parameter set")
+		}
+		nals = append(nals, u)
+	}
+
+	item, err := f.meta.data(it, f.src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nals = append(nals, hevc.SplitHVCC(item, rec.lengthSize)...)
+
+	dir := t.TempDir()
+	in := filepath.Join(dir, "thumb.h265")
+	out := filepath.Join(dir, "thumb.yuv")
+
+	if err := os.WriteFile(in, hevc.MarshalAnnexB(nals), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if b, err := exec.Command("dec265", "-q", "-o", out, in).CombinedOutput(); err != nil {
+		t.Fatalf("dec265: %v: %s", err, b)
+	}
+
+	yuv, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The item is coded 64x64 and the clean aperture keeps the top 64x48.
+	ycc := planar.(*image.YCbCr)
+	if len(yuv) != 64*64*3/2 {
+		t.Fatalf("dec265 wrote %d bytes", len(yuv))
+	}
+
+	for y := range 48 {
+		if !bytes.Equal(yuv[y*64:][:64], ycc.Y[y*ycc.YStride:][:64]) {
+			t.Fatalf("luma row %d differs from dec265", y)
+		}
+	}
+
+	for y := range 24 {
+		if !bytes.Equal(yuv[64*64+y*32:][:32], ycc.Cb[y*ycc.CStride:][:32]) ||
+			!bytes.Equal(yuv[64*64+32*32+y*32:][:32], ycc.Cr[y*ycc.CStride:][:32]) {
+			t.Fatalf("chroma row %d differs from dec265", y)
+		}
+	}
+}
+
 func TestMetadataWithoutMeta(t *testing.T) {
 	data := append(box("ftyp", []byte("heic\x00\x00\x00\x00mif1heic")), box("moov", nil)...)
 
